@@ -1,6 +1,5 @@
 # Stability and Predictive Performance of General Bayesian Inference Methods  
 ### Intermediate Results Summary  
-*(Based on `intermediate_results.pdf`)*
 
 ---
 
