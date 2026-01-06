@@ -4,5 +4,7 @@ This repository contains code and results for a Bachelor’s Honors Thesis (in p
 
 Experiments cover standard negative log-likelihood, generalized Bayesian inference with β- and γ-divergence, prediction-centric uncertainty quantification (PCUQ), and BayesBag. Both closed-form and variational approaches are applied, and results summarize each method's reliability and performance.
 
+The file `Bayes_Overview` contains the overview of the Bayesian methodologies considered in the thesis. The file `intermediate_results_thesis` contains the description of the intermediate experiments and results. 
+
 See the code and `Figures/` directory for more details. Full references are available in the accompanying thesis PDF.
 
