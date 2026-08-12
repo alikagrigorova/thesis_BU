@@ -689,7 +689,7 @@ def observed_discrepancy_gvi_knownvar_continuation(
 def observed_discrepancy_nuts_knownvar(D: int, N: int, beta: float, sigma2_assumed: float, sigma2_true: float,
                                          v0: Array, delta_true: Array, M: int, seed: int,
                                          num_warmup: int = 1000, num_samples: int = 2000,
-                                         target_accept_prob: float = 0.9) -> Tuple[float, float, Array]:
+                                         target_accept_prob: float = 0.9, log_fn=None) -> Tuple[float, float, Array]:
     """d~_{1/2}(beta) via NUTS instead of Laplace/GVI -- the actual ground-truth
     discrepancy, at real cost. Uses each fit's full sample mean/covariance,
     compared via the closed-form Gaussian BC on those Gaussian moment-matches
@@ -738,6 +738,90 @@ def observed_discrepancy_nuts_knownvar(D: int, N: int, beta: float, sigma2_assum
         if (m + 1) % 20 == 0:
             jax.clear_caches()
             gc.collect()
+        if (m + 1) % 10 == 0 and log_fn is not None:
+            log_fn(f"  [sequential NUTS] {m + 1}/{M} replicate pairs done")
+    return float(ds.mean()), float(ds.std(ddof=1) / np.sqrt(M)), ds
+
+
+def _numpyro_model_knownvar_batched(X, y, beta, sigma2, v0, B):
+    """Batched analog of _numpyro_model_knownvar: X (B,N,D), y (B,N) -- B
+    independent replicate regressions fit as ONE joint NUTS run over a
+    (B,D)-shaped delta, using numpyro.plate to keep each replicate's
+    likelihood independent (block-diagonal problem structure). Lets XLA
+    batch the linear algebra across all B replicates in one compiled
+    program instead of B sequential dispatches."""
+    with numpyro.plate("replicate", B):
+        delta = numpyro.sample("delta", dist.Normal(0.0, jnp.sqrt(v0)).to_event(1))  # (B, D)
+        mu = jnp.einsum('bnd,bd->bn', X, delta)  # (B, N)
+        if beta == 1.0:
+            numpyro.sample("obs", dist.Normal(mu, jnp.sqrt(sigma2)).to_event(1), obs=y)
+        else:
+            resid = y - mu
+            neg_loss = -jnp.sum(gaussian_beta_loss_pointwise(resid, sigma2, beta), axis=-1)
+            numpyro.factor("beta_loglik", neg_loss)
+
+
+def observed_discrepancy_nuts_knownvar_batched(D: int, N: int, beta: float, sigma2_assumed: float, sigma2_true: float,
+                                                 v0: Array, delta_true: Array, M: int, seed: int,
+                                                 num_warmup: int = 500, num_samples: int = 1000,
+                                                 target_accept_prob: float = 0.9, chunk_size: int = 10,
+                                                 log_fn=None) -> Tuple[float, float, Array]:
+    """Batched analog of observed_discrepancy_nuts_knownvar: fits chunk_size
+    replicates at once as ONE joint NUTS run (via numpyro.plate over the
+    block-independent model above), instead of M sequential single-replicate
+    fits -- lets XLA parallelize the linear algebra across the chunk in one
+    compiled program. Preserves the EXACT same PRNGKey scheme as the
+    sequential version (all 'a' fits use PRNGKey(seed), all 'b' fits use
+    PRNGKey(seed+1)) so results should match the sequential version up to
+    floating-point batching-order effects, not differ algorithmically.
+    Requires chunk_size to evenly divide M. Calls log_fn(str) after each
+    chunk (or prints, if log_fn is None) so progress through the M replicate
+    pairs is visible instead of the cell running silently for hours."""
+    import gc
+    assert M % chunk_size == 0, f"chunk_size ({chunk_size}) must evenly divide M ({M})"
+    v0_j = jnp.asarray(v0, dtype=jnp.float64)
+    B = chunk_size
+    log = log_fn or (lambda s: print(s, flush=True))
+
+    model_fn = lambda X, y: _numpyro_model_knownvar_batched(X, y, float(beta), float(sigma2_assumed), v0_j, B)
+    kernel_a = NUTS(model_fn, target_accept_prob=target_accept_prob)
+    mcmc_a = MCMC(kernel_a, num_warmup=num_warmup, num_samples=num_samples, num_chains=1, progress_bar=False)
+    kernel_b = NUTS(model_fn, target_accept_prob=target_accept_prob)
+    mcmc_b = MCMC(kernel_b, num_warmup=num_warmup, num_samples=num_samples, num_chains=1, progress_bar=False)
+
+    ds = np.empty(M)
+    n_chunks = M // chunk_size
+    for c in range(n_chunks):
+        m_lo = c * chunk_size
+        Xa_list, ya_list, Xb_list, yb_list = [], [], [], []
+        for i in range(chunk_size):
+            m = m_lo + i
+            Xa, ya = generate_variance_misspec_data(D, N, seed=2 * (seed * M + m), delta_true=delta_true, sigma2=sigma2_true)
+            Xb, yb = generate_variance_misspec_data(D, N, seed=2 * (seed * M + m) + 1, delta_true=delta_true, sigma2=sigma2_true)
+            Xa_list.append(Xa); ya_list.append(ya)
+            Xb_list.append(Xb); yb_list.append(yb)
+        Xa_batch = jnp.asarray(np.stack(Xa_list), dtype=jnp.float64)
+        ya_batch = jnp.asarray(np.stack(ya_list), dtype=jnp.float64)
+        Xb_batch = jnp.asarray(np.stack(Xb_list), dtype=jnp.float64)
+        yb_batch = jnp.asarray(np.stack(yb_list), dtype=jnp.float64)
+
+        mcmc_a.run(jax.random.PRNGKey(seed), Xa_batch, ya_batch)
+        samples_a = np.asarray(mcmc_a.get_samples()["delta"])  # (num_samples, B, D)
+
+        mcmc_b.run(jax.random.PRNGKey(seed + 1), Xb_batch, yb_batch)
+        samples_b = np.asarray(mcmc_b.get_samples()["delta"])  # (num_samples, B, D)
+
+        for i in range(chunk_size):
+            m = m_lo + i
+            sa, sb = samples_a[:, i, :], samples_b[:, i, :]
+            mean_a, cov_a = sa.mean(axis=0), np.cov(sa, rowvar=False)
+            mean_b, cov_b = sb.mean(axis=0), np.cov(sb, rowvar=False)
+            ds[m] = nbu.minus2logBC_mvn(mean_a, cov_a, mean_b, cov_b)
+
+        gc.collect()
+        log(f"  [batched NUTS] {m_lo + chunk_size}/{M} replicate pairs done")
+
+    jax.clear_caches()
     return float(ds.mean()), float(ds.std(ddof=1) / np.sqrt(M)), ds
 
 
